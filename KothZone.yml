@@ -1,0 +1,281 @@
+name: KothZone
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - ".github/workflows/KothZone.yml"
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+      - name: Write sources
+        run: |
+          mkdir -p kz/src/main/java/kothzone kz/src/main/resources
+          cat > kz/pom.xml <<'POM_EOF'
+          <?xml version="1.0" encoding="UTF-8"?>
+          <project xmlns="http://maven.apache.org/POM/4.0.0"
+                   xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+                   xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 http://maven.apache.org/xsd/maven-4.0.0.xsd">
+            <modelVersion>4.0.0</modelVersion>
+            <groupId>kothzone</groupId>
+            <artifactId>KothZone</artifactId>
+            <version>1.0.0</version>
+            <packaging>jar</packaging>
+            <properties>
+              <maven.compiler.source>17</maven.compiler.source>
+              <maven.compiler.target>17</maven.compiler.target>
+              <project.build.sourceEncoding>UTF-8</project.build.sourceEncoding>
+            </properties>
+            <repositories>
+              <repository>
+                <id>repo-lanink-cn</id>
+                <url>https://repo.lanink.cn/repository/maven-public/</url>
+              </repository>
+            </repositories>
+            <dependencies>
+              <dependency>
+                <groupId>com.nukkit-mot</groupId>
+                <artifactId>nukkit-mot</artifactId>
+                <version>1.26.30-R1</version>
+                <scope>provided</scope>
+              </dependency>
+            </dependencies>
+            <build>
+              <finalName>KothZone</finalName>
+            </build>
+          </project>
+          POM_EOF
+          cat > kz/src/main/resources/plugin.yml <<'PLUGIN_EOF'
+          name: KothZone
+          main: kothzone.KothZone
+          version: 1.0.0
+          api: ["1.0.0"]
+          load: POSTWORLD
+          author: server
+          description: Зоны PvP внутри защищённого спавна
+          commands:
+            koth:
+              description: Управление зонами PvP
+              usage: "/koth <pos1|pos2|create|delete|list>"
+              permission: kothzone.admin
+          permissions:
+            kothzone.admin:
+              description: Команда /koth
+              default: op
+          PLUGIN_EOF
+          cat > kz/src/main/java/kothzone/KothZone.java <<'JAVA_EOF'
+          package kothzone;
+
+          import cn.nukkit.Player;
+          import cn.nukkit.command.Command;
+          import cn.nukkit.command.CommandSender;
+          import cn.nukkit.event.EventHandler;
+          import cn.nukkit.event.EventPriority;
+          import cn.nukkit.event.Listener;
+          import cn.nukkit.event.entity.EntityDamageByEntityEvent;
+          import cn.nukkit.event.server.DataPacketSendEvent;
+          import cn.nukkit.network.protocol.TextPacket;
+          import cn.nukkit.plugin.PluginBase;
+          import cn.nukkit.scheduler.Task;
+          import cn.nukkit.utils.Config;
+
+          import java.io.File;
+          import java.util.ArrayList;
+          import java.util.HashMap;
+          import java.util.LinkedHashMap;
+          import java.util.List;
+          import java.util.Map;
+          import java.util.UUID;
+
+          /**
+           * Зоны PvP ("царь горы") внутри защищённого спавна.
+           *   /koth pos1            — первая точка (где стоишь)
+           *   /koth pos2            — вторая точка
+           *   /koth create <имя>    — создать зону по двум точкам
+           *   /koth delete <имя>    — удалить зону
+           *   /koth list            — список зон
+           * Зона считается по X/Z на всю высоту. Внутри зоны урон игрок→игрок разрешён,
+           * даже если другой плагин (регионы, защита спавна) его отменил.
+           */
+          public class KothZone extends PluginBase implements Listener {
+
+              private static class Zone {
+                  final String name, level;
+                  final int minX, maxX, minZ, maxZ;
+
+                  Zone(String name, String level, int x1, int z1, int x2, int z2) {
+                      this.name = name;
+                      this.level = level;
+                      this.minX = Math.min(x1, x2);
+                      this.maxX = Math.max(x1, x2);
+                      this.minZ = Math.min(z1, z2);
+                      this.maxZ = Math.max(z1, z2);
+                  }
+
+                  boolean contains(String lvl, double x, double z) {
+                      return level.equals(lvl) && x >= minX && x < maxX + 1 && z >= minZ && z < maxZ + 1;
+                  }
+
+                  String serialize() {
+                      return name + ";" + level + ";" + minX + ";" + minZ + ";" + maxX + ";" + maxZ;
+                  }
+              }
+
+              private Config cfg;
+              private final Map<String, Zone> zones = new LinkedHashMap<>();
+              private final Map<UUID, int[]> pos1 = new HashMap<>();
+              private final Map<UUID, int[]> pos2 = new HashMap<>();
+              private final Map<UUID, String> inside = new HashMap<>();
+
+              @Override
+              public void onEnable() {
+                  getDataFolder().mkdirs();
+                  cfg = new Config(new File(getDataFolder(), "config.yml"), Config.YAML);
+                  for (String s : cfg.getStringList("zones")) {
+                      String[] p = s.split(";");
+                      if (p.length != 6) continue;
+                      try {
+                          zones.put(p[0].toLowerCase(), new Zone(p[0], p[1], Integer.parseInt(p[2]), Integer.parseInt(p[3]),
+                                  Integer.parseInt(p[4]), Integer.parseInt(p[5])));
+                      } catch (NumberFormatException ignored) {
+                      }
+                  }
+                  getServer().getPluginManager().registerEvents(this, this);
+                  getServer().getScheduler().scheduleRepeatingTask(this, new Task() {
+                      @Override
+                      public void onRun(int tick) {
+                          notifyEnterLeave();
+                      }
+                  }, 10);
+                  getLogger().info("KothZone: зон загружено: " + zones.size());
+              }
+
+              private void save() {
+                  List<String> out = new ArrayList<>();
+                  for (Zone z : zones.values()) out.add(z.serialize());
+                  cfg.set("zones", out);
+                  cfg.save();
+              }
+
+              private Zone zoneAt(Player p) {
+                  if (p == null || p.getLevel() == null) return null;
+                  String lvl = p.getLevel().getName();
+                  for (Zone z : zones.values()) {
+                      if (z.contains(lvl, p.getX(), p.getZ())) return z;
+                  }
+                  return null;
+              }
+
+              @Override
+              public boolean onCommand(CommandSender sender, Command command, String label, String[] args) {
+                  if (!command.getName().equalsIgnoreCase("koth")) return false;
+                  String sub = args.length > 0 ? args[0].toLowerCase() : "";
+                  switch (sub) {
+                      case "pos1":
+                      case "pos2": {
+                          if (!(sender instanceof Player)) {
+                              sender.sendMessage("Только для игрока.");
+                              return true;
+                          }
+                          Player p = (Player) sender;
+                          int[] pt = {(int) Math.floor(p.getX()), (int) Math.floor(p.getZ())};
+                          if (sub.equals("pos1")) pos1.put(p.getUniqueId(), pt);
+                          else pos2.put(p.getUniqueId(), pt);
+                          sender.sendMessage(sub + " = " + pt[0] + ", " + pt[1]);
+                          return true;
+                      }
+                      case "create": {
+                          if (!(sender instanceof Player) || args.length < 2) {
+                              sender.sendMessage("Использование: /koth create <имя> (сначала /koth pos1 и /koth pos2)");
+                              return true;
+                          }
+                          Player p = (Player) sender;
+                          int[] a = pos1.get(p.getUniqueId()), b = pos2.get(p.getUniqueId());
+                          if (a == null || b == null) {
+                              sender.sendMessage("Сначала поставь обе точки: /koth pos1 и /koth pos2.");
+                              return true;
+                          }
+                          Zone z = new Zone(args[1], p.getLevel().getName(), a[0], a[1], b[0], b[1]);
+                          zones.put(args[1].toLowerCase(), z);
+                          save();
+                          sender.sendMessage("Зона PvP \"" + args[1] + "\" создана: X " + z.minX + ".." + z.maxX + ", Z " + z.minZ + ".." + z.maxZ);
+                          return true;
+                      }
+                      case "delete": {
+                          if (args.length < 2) {
+                              sender.sendMessage("Использование: /koth delete <имя>");
+                              return true;
+                          }
+                          if (zones.remove(args[1].toLowerCase()) == null) sender.sendMessage("Такой зоны нет.");
+                          else {
+                              save();
+                              sender.sendMessage("Зона удалена.");
+                          }
+                          return true;
+                      }
+                      case "list": {
+                          if (zones.isEmpty()) sender.sendMessage("Зон нет.");
+                          for (Zone z : zones.values()) {
+                              sender.sendMessage(z.name + ": мир " + z.level + ", X " + z.minX + ".." + z.maxX + ", Z " + z.minZ + ".." + z.maxZ);
+                          }
+                          return true;
+                      }
+                      default:
+                          sender.sendMessage("/koth pos1 | pos2 | create <имя> | delete <имя> | list");
+                          return true;
+                  }
+              }
+
+              /**
+               * MONITOR выполняется последним: если регионы/защита спавна отменили удар,
+               * а оба игрока стоят в зоне PvP, то отмену снимаем.
+               */
+              @EventHandler(priority = EventPriority.MONITOR, ignoreCancelled = false)
+              public void onDamage(EntityDamageByEntityEvent e) {
+                  if (!e.isCancelled()) return;
+                  if (!(e.getEntity() instanceof Player) || !(e.getDamager() instanceof Player)) return;
+                  Player victim = (Player) e.getEntity();
+                  Player attacker = (Player) e.getDamager();
+                  if (victim == attacker) return;
+                  if (zoneAt(victim) != null && zoneAt(attacker) != null) e.setCancelled(false);
+              }
+
+              /**
+               * MyRegions при отменённом ударе шлёт игроку "PvP в этом регионе отключено!".
+               * Внутри зоны PvP этот текст перехватываем, чтобы он не мелькал.
+               */
+              @EventHandler(priority = EventPriority.HIGHEST, ignoreCancelled = false)
+              public void onPacketSend(DataPacketSendEvent e) {
+                  if (!(e.getPacket() instanceof TextPacket)) return;
+                  String m = ((TextPacket) e.getPacket()).message;
+                  if (m == null || !m.contains("PvP в этом регионе отключено")) return;
+                  if (zoneAt(e.getPlayer()) != null) e.setCancelled(true);
+              }
+
+              private void notifyEnterLeave() {
+                  if (zones.isEmpty() && inside.isEmpty()) return;
+                  for (Player p : getServer().getOnlinePlayers().values()) {
+                      Zone z = zoneAt(p);
+                      String now = z == null ? null : z.name;
+                      String was = inside.get(p.getUniqueId());
+                      if (now != null && !now.equals(was)) {
+                          p.sendMessage("§cВы вошли в зону PvP: " + now);
+                          inside.put(p.getUniqueId(), now);
+                      } else if (now == null && was != null) {
+                          p.sendMessage("§aВы вышли из зоны PvP.");
+                          inside.remove(p.getUniqueId());
+                      }
+                  }
+              }
+          }
+          JAVA_EOF
+      - name: Build
+        run: cd kz && mvn -B -q package
+      - uses: actions/upload-artifact@v4
+        with:
+          name: KothZone
+          path: kz/target/KothZone.jar
